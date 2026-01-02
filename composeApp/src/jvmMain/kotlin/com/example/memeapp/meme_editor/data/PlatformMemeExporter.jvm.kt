@@ -5,6 +5,8 @@ import com.example.memeapp.meme_editor.domain.MemeExporter
 import com.example.memeapp.meme_editor.domain.SaveToStorageStrategy
 import com.example.memeapp.meme_editor.presentation.MemeText
 import com.example.memeapp.meme_editor.presentation.util.MemeRenderCalculator
+import com.example.memeapp.meme_editor.presentation.util.MemeRenderCalculatorWeb
+import com.example.memeapp.meme_editor.presentation.util.ScaledMemeText
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.awt.BasicStroke
@@ -22,8 +24,8 @@ import javax.imageio.ImageIO
 
 actual class PlatformMemeExporter : MemeExporter {
 
-    // You might need to adjust density if the text looks too small/big on desktop
-    private val memeRenderCalculator = MemeRenderCalculator(density = 2.0f)
+    // 1. Force Density to 2.0f (Just like Web) to ensure high-quality text export
+    private val memeRenderCalculator = MemeRenderCalculatorWeb(density = 2.0f)
 
     actual override suspend fun exportMeme(
         backgroundImageBytes: ByteArray,
@@ -35,13 +37,11 @@ actual class PlatformMemeExporter : MemeExporter {
         try {
             println("DEBUG: Starting export...")
 
-            // 1. Read Image
             val inputStream = ByteArrayInputStream(backgroundImageBytes)
             val originalImage: BufferedImage = ImageIO.read(inputStream)
                 ?: throw IllegalArgumentException("Failed to read input image. Is it a PNG/JPG?")
-            println("DEBUG: Image read successfully. Size: ${originalImage.width}x${originalImage.height}")
 
-            // 2. Create Canvas
+            // 2. Create the Canvas (RGB for JPEG compatibility)
             val outputImage = BufferedImage(
                 originalImage.width,
                 originalImage.height,
@@ -49,88 +49,116 @@ actual class PlatformMemeExporter : MemeExporter {
             )
             val g2d = outputImage.createGraphics()
 
-            // ... (Your drawing settings and drawImage code here) ...
+            // 3. Enable Anti-Aliasing (Crucial for smooth text)
+            g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+            g2d.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
+            g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY)
+
+            // 4. Draw Background
             g2d.drawImage(originalImage, 0, 0, null)
 
-            // ... (Your text rendering loop here) ...
-            // Just ensure you dispose at the end:
-            g2d.dispose()
+            // 5. Calculate Scale Factors
+            val scaleFactors = memeRenderCalculator.calculateScaleFactors(
+                bitmapWidth = originalImage.width,
+                bitmapHeight = originalImage.height,
+                templateSize = templateSize
+            )
+
+            // 6. Draw Each Text Element
+            memeTexts.forEach { memeText ->
+                val scaled = memeRenderCalculator.calculateScaledMemeText(
+                    memeText, scaleFactors, templateSize
+                )
+                drawText(g2d, scaled)
+            }
+
+            g2d.dispose() // Clean up graphics
             println("DEBUG: Drawing finished.")
 
-            // 3. Get Path from User
+            // 7. Save File
             val rawPath = saveToStorageStrategy.getFilePath(fileName)
-            println("DEBUG: User selected path: $rawPath")
-
-            // 4. Ensure Extension
-            // If user typed "my_meme" without .jpg, we fix it here.
-            val finalFile = if (rawPath.endsWith(".jpg", ignoreCase = true) || rawPath.endsWith(".jpeg", ignoreCase = true)) {
+            val finalFile = if (rawPath.endsWith(".jpg", true) || rawPath.endsWith(".jpeg", true)) {
                 File(rawPath)
             } else {
                 File("$rawPath.jpg")
             }
 
-            // 5. Write to Disk
             val success = ImageIO.write(outputImage, "jpg", finalFile)
 
             if (success) {
-                println("DEBUG: Saved successfully to: ${finalFile.absolutePath}")
                 Result.success(finalFile.absolutePath)
             } else {
-                println("ERROR: ImageIO.write returned false. No writer found for 'jpg'?")
                 Result.failure(Exception("ImageIO failed to write image"))
             }
 
         } catch (e: Exception) {
-            println("ERROR: Exception during export: ${e.message}")
-            e.printStackTrace() // This prints the full error stack to the console
+            e.printStackTrace()
             Result.failure(e)
         }
     }
 
-    private fun drawText(g2d: Graphics2D, memeText: com.example.memeapp.meme_editor.presentation.util.ScaledMemeText) {
-        // Save original transform to restore later
+    private fun drawText(g2d: Graphics2D, memeText: ScaledMemeText) {
         val originalTransform = g2d.transform
 
-        // Create Font (Using Impact or fallback to SansSerif)
-        val font = Font("Impact", Font.BOLD, memeText.scaledFontSizePx.toInt())
+        // 1. Setup Font
+        // We ensure a valid size (at least 1px) to prevent crashes
+        val fontSize = memeText.scaledFontSizePx.toInt().coerceAtLeast(1)
+        val font = Font("Impact", Font.BOLD, fontSize)
         g2d.font = font
+        val frc = g2d.fontRenderContext
 
-        // Get text metrics to center it
-        val fontMetrics = g2d.fontMetrics
-        val textWidth = fontMetrics.stringWidth(memeText.text)
-        val textHeight = fontMetrics.ascent - fontMetrics.descent
+        // 2. Handle Multi-line Text (Split by \n)
+        val lines = memeText.text.split("\n")
 
-        // Calculate Position
-        val boxWidth = textWidth + memeText.textPaddingX * 2
-        val boxHeight = textHeight + memeText.textPaddingY * 2
+        // Calculate Line Height based on the font
+        // "Impact" is a tall font, so 1.1x or 1.2x spacing works well
+        val metrics = g2d.fontMetrics
+        val lineHeight = metrics.height
+        val totalTextHeight = lineHeight * lines.size
+
+        // 3. Calculate Box Dimensions (Widest line)
+        var maxWidth = 0
+        lines.forEach { line ->
+            val w = metrics.stringWidth(line)
+            if (w > maxWidth) maxWidth = w
+        }
+
+        val boxWidth = maxWidth + memeText.textPaddingX * 2
+        val boxHeight = totalTextHeight + memeText.textPaddingY * 2
+
         val centerX = memeText.scaledOffset.x + boxWidth / 2f
         val centerY = memeText.scaledOffset.y + boxHeight / 2f
 
-        // Apply Transformations (Translate -> Rotate -> Scale)
+        // 4. Apply Transformations
         g2d.translate(centerX.toDouble(), centerY.toDouble())
         g2d.scale(memeText.scale.toDouble(), memeText.scale.toDouble())
         g2d.rotate(Math.toRadians(memeText.rotation.toDouble()))
 
-        // Center text in the new coordinate system
-        val x = -textWidth / 2f
-        val y = (textHeight / 2f)
+        // 5. Draw Each Line
+        // We start drawing from the top-most line relative to vertical center
+        val startY = -(totalTextHeight / 2) + (metrics.ascent) - (metrics.descent / 2)
 
-        // Create a Shape of the text for outlining
-        val fontRenderContext = g2d.fontRenderContext
-        val textLayout = TextLayout(memeText.text, font, fontRenderContext)
-        val transform = AffineTransform.getTranslateInstance(x.toDouble(), y.toDouble())
-        val outline: Shape = textLayout.getOutline(transform)
+        lines.forEachIndexed { index, line ->
+            // Center this specific line horizontally
+            val lineWidth = metrics.stringWidth(line)
+            val x = -lineWidth / 2.0
+            val y = startY + (index * lineHeight).toDouble()
 
-        // Draw Stroke (Black Outline)
-        g2d.color = Color.BLACK
-        g2d.stroke = BasicStroke(memeText.strokeWidth)
-        g2d.draw(outline)
+            // Get outline for Stroke effect
+            val textLayout = TextLayout(line, font, frc)
+            val transform = AffineTransform.getTranslateInstance(x, y)
+            val outline: Shape = textLayout.getOutline(transform)
 
-        // Draw Fill (White Inside)
-        g2d.color = Color.WHITE
-        g2d.fill(outline)
+            // Draw Black Stroke
+            g2d.color = Color.BLACK
+            g2d.stroke = BasicStroke(memeText.strokeWidth)
+            g2d.draw(outline)
 
-        // Restore original position for the next text
+            // Draw White Fill
+            g2d.color = Color.WHITE
+            g2d.fill(outline)
+        }
+
         g2d.transform = originalTransform
     }
 }
